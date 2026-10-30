@@ -1,11 +1,18 @@
 import sqlite3
+import os
 from typing import List, Tuple
 
 
 class Database:
     def __init__(self, db_path: str = "prachka.db"):
         self.db_path = db_path
-        self._init_db()
+        try:
+            self._init_db()
+        except sqlite3.DatabaseError:
+            # Если файл повреждён, удаляем и инициализируем заново
+            if os.path.exists(self.db_path):
+                os.remove(self.db_path)
+            self._init_db()
 
     def _get_connection(self):
         conn = sqlite3.connect(self.db_path)

@@ -410,10 +410,14 @@ async def cb_c_slots(call: CallbackQuery):
 async def cb_win(call: CallbackQuery):
     buttons = []
     for s, e in db.get_windows():
-        buttons.append([InlineKeyboardButton(text=f"❌ Удалить {s}–{e}", callback_data=f"del_w:{s}:{e}")])
+        # Было:
+        # buttons.append([InlineKeyboardButton(text=f"❌ Удалить {s}–{e}", callback_data=f"del_w:{s}:{e}")])
+        
+        # Стало (разделяем дефисом или нижним подчеркиванием):
+        buttons.append([InlineKeyboardButton(text=f"❌ Удалить {s}–{e}", callback_data=f"del_w:{s}_{e}")])
     buttons.append([
-        InlineKeyboardButton(text="➕ 20:58-21:05", callback_data="add_w:20:58:21:05"),
-        InlineKeyboardButton(text="➕ 21:58-22:05", callback_data="add_w:21:58:22:05"),
+        InlineKeyboardButton(text="➕ 20:58-21:05", callback_data="add_w:20:58_21:05"),
+        InlineKeyboardButton(text="➕ 21:58-22:05", callback_data="add_w:21:58_22:05"),
     ])
     buttons.append([InlineKeyboardButton(text="⌨️ Свой интервал", callback_data="custom_w")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
@@ -423,14 +427,16 @@ async def cb_win(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("del_w:"))
 async def cb_del_w(call: CallbackQuery):
-    _, s, e = call.data.split(":")
+    raw_times = call.data.split(":", 1)[1]  # Получаем "20:58_21:05"
+    s, e = raw_times.split("_")             # Извлекаем s="20:58", e="21:05"
     db.delete_window(s, e)
     await cb_win(call)
 
 
 @dp.callback_query(F.data.startswith("add_w:"))
 async def cb_add_w(call: CallbackQuery):
-    _, s, e = call.data.split(":")
+    raw_times = call.data.split(":", 1)[1]  # Получаем "20:58_21:05"
+    s, e = raw_times.split("_")
     db.add_window(s, e)
     await cb_win(call)
 

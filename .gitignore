@@ -1,26 +1,7 @@
-# Виртуальное окружение
-venv/
-.venv/
-env/
-
-# Кэш Python
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Конфигурация и секреты (КРИТИЧНО)
+prachka.db
+prachka.db-journal
 .env
 credentials.json
-*.json
-!config.example.json
-
-# Локальная база данных SQLite и логи
-*.db
-*.db-journal
-*.sqlite3
-*.log
-
-# Файлы IDE и редакторов
-.vscode/
-.idea/
-*.swp
+venv/
+.venv/
+__pycache__/
