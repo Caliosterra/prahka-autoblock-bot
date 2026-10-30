@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Tuple, Optional
@@ -23,7 +24,6 @@ from google.oauth2.service_account import Credentials
 from database import Database
 from middlewares import AccessMiddleware
 
-# Загрузка переменных из .env, сгенерированного deploy.sh
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -52,19 +52,17 @@ MACHINE_OFFSETS = {
 
 HOURS_TO_ROW = {f"{h}:00": h - 3 for h in range(8, 23)}
 
-# Инициализация базы данных
 db = Database("prachka.db")
 
 
 def apply_log_level(level_name: str):
     lvl = getattr(logging, level_name.upper(), logging.INFO)
     logging.getLogger().setLevel(lvl)
-    # Сторонние библиотеки держим в тихом режиме
     logging.getLogger("googleapiclient").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("aiogram.event").setLevel(logging.WARNING if lvl >= logging.INFO else logging.INFO)
 
-# Заполнение базовых окон активности при первом запуске
+
 if not db.get_windows():
     for w in [("20:58", "21:05"), ("21:58", "22:05"), ("23:58", "00:05")]:
         db.add_window(w[0], w[1])
@@ -75,6 +73,7 @@ class Form(StatesGroup):
     waiting_for_custom_date = State()
     waiting_for_window = State()
     waiting_for_sheet_url = State()
+    waiting_for_preset_name = State()
 
 
 class RuntimeState:
@@ -82,7 +81,6 @@ class RuntimeState:
         self.is_running: bool = False
         self.known_left: str = ""
         self.known_right: str = ""
-        self.temp_hour: Optional[str] = None
         self.last_ping: str = "Никогда"
         self.mode_str: str = "Остановлен"
         self.task: Optional[asyncio.Task] = None
@@ -92,12 +90,10 @@ runtime = RuntimeState()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Подключение AccessMiddleware для сообщений и кнопок
 dp.message.middleware(AccessMiddleware(ALLOWED_USER_IDS))
 dp.callback_query.middleware(AccessMiddleware(ALLOWED_USER_IDS))
 
 
-# --- Google Sheets ---
 def get_worksheet():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -121,7 +117,6 @@ def is_free(val: str) -> bool:
     return not val.strip()
 
 
-# --- Тайминги и окна ---
 def in_hot_window(now: datetime) -> Tuple[bool, Optional[str]]:
     cur_m = now.hour * 60 + now.minute
     for s_str, e_str in db.get_windows():
@@ -150,7 +145,6 @@ async def smart_sleep():
         await asyncio.sleep(max(0.5, wait_sec))
 
 
-# --- Фоновый воркер-снайпер ---
 async def sniper_worker(chat_id: int):
     logging.info("🎯 Снайпер запущен в фоновом режиме.")
     try:
@@ -196,7 +190,6 @@ async def sniper_worker(chat_id: int):
                 f"[{runtime.last_ping}] Опрос таблицы. Цель: '{target_date}'. В таблице: A2='{left_h}', M2='{right_h}'"
             )
 
-            # Проверка обновления таблицы для самообучения
             changed = False
             if runtime.known_left and left_h and left_h != runtime.known_left:
                 changed = True
@@ -217,7 +210,6 @@ async def sniper_worker(chat_id: int):
                     parse_mode="Markdown"
                 )
 
-            # Поиск целевой даты в шапках
             base_col = None
             if target_date and target_date in left_h:
                 base_col = 0
@@ -225,164 +217,156 @@ async def sniper_worker(chat_id: int):
             elif target_date and target_date in right_h:
                 base_col = 12
                 logging.info(f"🎯 Найдена целевая дата '{target_date}' в ПРАВОМ блоке (M2)!")
-            else:
-                logging.debug(f"Целевая дата '{target_date}' пока не появилась в таблице.")
 
             if base_col is not None:
-                # Разделяем слоты на категории: Стирка (М) и Сушка (С)
                 wash_targets = [t for t in targets if t[1].startswith("М")]
                 dry_targets = [t for t in targets if t[1].startswith("С")]
+                other_targets = [t for t in targets if not t[1].startswith("М") and not t[1].startswith("С")]
 
                 categories_to_book = []
                 if wash_targets:
                     categories_to_book.append(("Стирка", wash_targets))
                 if dry_targets:
                     categories_to_book.append(("Сушка", dry_targets))
-
-                # Если заданы слоты без префиксов М/С, обрабатываем их общим списком
-                other_targets = [t for t in targets if not t[1].startswith("М") and not t[1].startswith("С")]
                 if other_targets:
-                    categories_to_book.append(("Остальное", other_targets))
+                    categories_to_book.append(("Прочее", other_targets))
 
                 successful_bookings = []
                 failed_categories = []
 
                 for cat_name, cat_slots in categories_to_book:
                     cat_booked = False
-                    logging.info(f"Начинаю бронирование категории: {cat_name} (вариантов: {len(cat_slots)})")
+                    logging.info(f"Начинаю бронирование ветки: {cat_name} (вариантов: {len(cat_slots)})")
 
-                    # Проверяем, настроена ли сдвоенная бронь (2 часа подряд на одной машинке)
-                    double_slot_pairs = []
-                    i = 0
-                    while i < len(cat_slots) - 1:
-                        t1_str, m1 = cat_slots[i]
-                        t2_str, m2 = cat_slots[i + 1]
-                        
-                        h1 = int(t1_str.split(":")[0])
-                        h2 = int(t2_str.split(":")[0])
-                        
-                        # Если одинаковая машинка и время идет подряд (например, 18:00 и 19:00)
-                        if m1 == m2 and h2 == h1 + 1:
-                            double_slot_pairs.append(((t1_str, m1), (t2_str, m2)))
-                            i += 2
-                        else:
-                            i += 1
+                    for idx, (time_str, mach_code) in enumerate(cat_slots):
+                        is_first_priority = (idx == 0)
 
-                    # 1. Сначала пробуем занять сдвоенные слоты (если они были заданы)
-                    for (slot1, slot2) in double_slot_pairs:
-                        t1_str, m_code = slot1
-                        t2_str, _ = slot2
-
-                        def get_slot_coord(t_str, m_cd):
-                            tc = t_str.strip()
-                            if ":" not in tc: tc = f"{tc}:00"
-                            if tc.startswith("0") and len(tc) == 5: tc = tc[1:]
-                            if tc not in HOURS_TO_ROW or m_cd not in MACHINE_OFFSETS:
-                                return None
-                            r_idx = HOURS_TO_ROW[tc] - 1
-                            c_idx = base_col + MACHINE_OFFSETS[m_cd][0]
-                            return r_idx, c_idx, f"{col_to_letter(c_idx)}{r_idx + 1}"
-
-                        c1 = get_slot_coord(t1_str, m_code)
-                        c2 = get_slot_coord(t2_str, m_code)
-                        if not c1 or not c2:
+                        if mach_code not in MACHINE_OFFSETS:
                             continue
 
-                        r1_idx, col_idx, cell1 = c1
-                        r2_idx, _, cell2 = c2
-
-                        val1 = grid[r1_idx][col_idx].strip() if r1_idx < len(grid) and col_idx < len(grid[r1_idx]) else ""
-                        val2 = grid[r2_idx][col_idx].strip() if r2_idx < len(grid) and col_idx < len(grid[r2_idx]) else ""
-
-                        logging.info(f"[{cat_name}] Проверка 2х часов подряд: {t1_str}+{t2_str} {m_code} ({cell1}, {cell2}): '{val1}', '{val2}'")
-
-                        if is_free(val1) and is_free(val2):
-                            logging.info(f"Оба слота {cell1} и {cell2} свободны! Записываю {room}...")
-                            await asyncio.to_thread(sheet.update_acell, cell1, room)
-                            await asyncio.to_thread(sheet.update_acell, cell2, room)
-                            await asyncio.sleep(0.7)
-
-                            chk1 = (await asyncio.to_thread(sheet.acell, cell1)).value or ""
-                            chk2 = (await asyncio.to_thread(sheet.acell, cell2)).value or ""
-
-                            if chk1.strip() == room and chk2.strip() == room:
-                                logging.info(f"✅ Успешно забронированы 2 часа подряд: {cell1} и {cell2}")
-                                successful_bookings.append({
-                                    "cat": cat_name,
-                                    "time": f"{t1_str} и {t2_str}",
-                                    "mach": MACHINE_OFFSETS[m_code][1],
-                                    "cell": f"{cell1}, {cell2}"
-                                })
-                                cat_booked = True
-                                break
-                            else:
-                                logging.warning(f"Коллизия при сдвоенной брони ({cell1}='{chk1}', {cell2}='{chk2}')")
-                                await bot.send_message(
-                                    chat_id,
-                                    f"⚠️ Коллизия при брони 2х часов на `{m_code}`. Пробую следующий вариант...",
-                                    parse_mode="Markdown"
-                                )
-
-                    if cat_booked:
-                        continue
-
-                    # 2. Если сдвоенные слоты не нашли или они не заданы, пробуем одиночные слоты по порядку
-                    for time_str, mach_code in cat_slots:
-                        t_clean = time_str.strip()
-                        if ":" not in t_clean: t_clean = f"{t_clean}:00"
-                        if t_clean.startswith("0") and len(t_clean) == 5: t_clean = t_clean[1:]
-
-                        if t_clean not in HOURS_TO_ROW or mach_code not in MACHINE_OFFSETS:
-                            continue
-
-                        row_idx = HOURS_TO_ROW[t_clean] - 1
-                        row_num = row_idx + 1
                         offset, mach_name = MACHINE_OFFSETS[mach_code]
                         col_idx = base_col + offset
-                        cell = f"{col_to_letter(col_idx)}{row_num}"
 
-                        row_data = grid[row_idx] if row_idx < len(grid) else []
-                        val = row_data[col_idx].strip() if col_idx < len(row_data) else ""
+                        is_double = "(2ч)" in time_str or "2ч" in time_str
+                        raw_h = time_str.replace("(2ч)", "").replace("2ч", "").strip()
+                        if ":" not in raw_h:
+                            raw_h = f"{raw_h}:00"
+                        h_start = int(raw_h.split(":")[0])
 
-                        logging.info(f"[{cat_name}] Проверка одиночного слота {t_clean} {mach_name} ({cell}): '{val}'")
+                        if is_double:
+                            t1 = f"{h_start}:00"
+                            t2 = f"{h_start + 1}:00"
 
-                        if is_free(val):
-                            logging.info(f"Ячейка {cell} свободна, записываю {room}...")
-                            await asyncio.to_thread(sheet.update_acell, cell, room)
-                            await asyncio.sleep(0.7)
-                            check_val = (await asyncio.to_thread(sheet.acell, cell)).value or ""
+                            if t1 not in HOURS_TO_ROW or t2 not in HOURS_TO_ROW:
+                                logging.warning(f"Интервал {t1}-{t2} выходит за границы таблицы.")
+                                continue
 
-                            if check_val.strip() == room:
-                                # Обновляем локальную сетку, чтобы следующие проверки учитывали эту запись
-                                while len(grid) <= row_idx:
-                                    grid.append([])
-                                while len(grid[row_idx]) <= col_idx:
-                                    grid[row_idx].append("")
-                                grid[row_idx][col_idx] = room
+                            r1_idx = HOURS_TO_ROW[t1] - 1
+                            r2_idx = HOURS_TO_ROW[t2] - 1
+                            cell1 = f"{col_to_letter(col_idx)}{r1_idx + 1}"
+                            cell2 = f"{col_to_letter(col_idx)}{r2_idx + 1}"
 
-                                logging.info(f"✅ Успешно забронирован слот: {cell}")
-                                successful_bookings.append({
-                                    "cat": cat_name,
-                                    "time": time_str,
-                                    "mach": mach_name,
-                                    "cell": cell
-                                })
-                                cat_booked = True
-                                break
+                            row1 = grid[r1_idx] if r1_idx < len(grid) else []
+                            row2 = grid[r2_idx] if r2_idx < len(grid) else []
+                            val1 = row1[col_idx].strip() if col_idx < len(row1) else ""
+                            val2 = row2[col_idx].strip() if col_idx < len(row2) else ""
+
+                            logging.info(f"[{cat_name}] Проверка 2х часов: {t1}+{t2} {mach_name} ({cell1}, {cell2}): '{val1}', '{val2}'")
+
+                            if is_free(val1) and is_free(val2):
+                                if is_first_priority:
+                                    human_delay = round(random.uniform(1.8, 2.4), 2)
+                                    logging.info(f"[{cat_name}] Первый приоритет свободен! Пауза имитации человека: {human_delay} с...")
+                                    await asyncio.sleep(human_delay)
+
+                                logging.info(f"Оба часа свободны! Записываю {room} в {cell1} и {cell2}...")
+                                await asyncio.to_thread(sheet.update_acell, cell1, room)
+                                await asyncio.to_thread(sheet.update_acell, cell2, room)
+                                await asyncio.sleep(0.7)
+
+                                chk1 = (await asyncio.to_thread(sheet.acell, cell1)).value or ""
+                                chk2 = (await asyncio.to_thread(sheet.acell, cell2)).value or ""
+
+                                if chk1.strip() == room and chk2.strip() == room:
+                                    logging.info(f"✅ Успешно забронированы 2 часа подряд: {cell1} и {cell2}")
+                                    while len(grid) <= max(r1_idx, r2_idx):
+                                        grid.append([])
+                                    while len(grid[r1_idx]) <= col_idx: grid[r1_idx].append("")
+                                    while len(grid[r2_idx]) <= col_idx: grid[r2_idx].append("")
+                                    grid[r1_idx][col_idx] = room
+                                    grid[r2_idx][col_idx] = room
+
+                                    successful_bookings.append({
+                                        "cat": cat_name,
+                                        "time": f"{h_start}:00–{h_start + 2}:00 (2 часа)",
+                                        "mach": mach_name,
+                                        "cell": f"{cell1}, {cell2}"
+                                    })
+                                    cat_booked = True
+                                    break
+                                else:
+                                    logging.warning(f"Коллизия при 2х часах в {cell1} или {cell2}")
+                                    await bot.send_message(
+                                        chat_id,
+                                        f"⚠️ Коллизия при брони 2х часов на `{mach_name}`. Пробую следующий вариант ветки...",
+                                        parse_mode="Markdown"
+                                    )
                             else:
-                                logging.warning(f"Коллизия в {cell}: записалось '{check_val}' вместо '{room}'")
-                                await bot.send_message(
-                                    chat_id,
-                                    f"⚠️ Коллизия в `{cell}` (занял `{check_val}`). Пробую дальше...",
-                                    parse_mode="Markdown"
-                                )
+                                logging.info(f"[{cat_name}] Один из часов занят ({cell1}='{val1}', {cell2}='{val2}'). Перехожу дальше.")
+                                continue
+
                         else:
-                            logging.info(f"Слот {cell} занят значением: '{val}'. Пропускаю.")
+                            t1 = f"{h_start}:00"
+                            if t1 not in HOURS_TO_ROW:
+                                continue
+
+                            r1_idx = HOURS_TO_ROW[t1] - 1
+                            cell1 = f"{col_to_letter(col_idx)}{r1_idx + 1}"
+
+                            row1 = grid[r1_idx] if r1_idx < len(grid) else []
+                            val1 = row1[col_idx].strip() if col_idx < len(row1) else ""
+
+                            logging.info(f"[{cat_name}] Проверка одиночного слота: {t1} {mach_name} ({cell1}): '{val1}'")
+
+                            if is_free(val1):
+                                if is_first_priority:
+                                    human_delay = round(random.uniform(1.8, 2.4), 2)
+                                    logging.info(f"[{cat_name}] Первый приоритет свободен! Пауза имитации человека: {human_delay} с...")
+                                    await asyncio.sleep(human_delay)
+
+                                logging.info(f"Слот {cell1} свободен, записываю {room}...")
+                                await asyncio.to_thread(sheet.update_acell, cell1, room)
+                                await asyncio.sleep(0.7)
+                                chk1 = (await asyncio.to_thread(sheet.acell, cell1)).value or ""
+
+                                if chk1.strip() == room:
+                                    logging.info(f"✅ Успешно забронирован слот: {cell1}")
+                                    while len(grid) <= r1_idx: grid.append([])
+                                    while len(grid[r1_idx]) <= col_idx: grid[r1_idx].append("")
+                                    grid[r1_idx][col_idx] = room
+
+                                    successful_bookings.append({
+                                        "cat": cat_name,
+                                        "time": t1,
+                                        "mach": mach_name,
+                                        "cell": cell1
+                                    })
+                                    cat_booked = True
+                                    break
+                                else:
+                                    logging.warning(f"Коллизия в {cell1}: занял {chk1}")
+                                    await bot.send_message(
+                                        chat_id,
+                                        f"⚠️ Коллизия в `{cell1}` (занял `{chk1}`). Пробую следующий вариант...",
+                                        parse_mode="Markdown"
+                                    )
+                            else:
+                                logging.info(f"[{cat_name}] Слот {cell1} занят: '{val1}'. Перехожу дальше.")
+                                continue
 
                     if not cat_booked:
                         failed_categories.append(cat_name)
 
-                # Завершение работы снайпера и отчёт пользователю
                 runtime.is_running = False
                 runtime.mode_str = "Завершено" if successful_bookings else "Остановлен"
 
@@ -409,7 +393,6 @@ async def sniper_worker(chat_id: int):
             await asyncio.sleep(2)
 
 
-# --- Клавиатуры и визуальное меню ---
 def get_main_text(note: str = "") -> str:
     target_date = db.get_setting("target_date", "Не задана")
     room = db.get_setting("room", DEFAULT_ROOM)
@@ -418,9 +401,24 @@ def get_main_text(note: str = "") -> str:
     logs = db.get_recent_logs(2)
 
     status_str = "🟢 **АКТИВЕН**" if runtime.is_running else "⚪ **Остановлен**"
-    targets_str = " → ".join([f"`{t[0]} {t[1]}`" for t in targets]) if targets else "_Не выбраны_"
+
+    wash_targets = [f"`{t[0]} {t[1]}`" for t in targets if t[1].startswith("М")]
+    dry_targets = [f"`{t[0]} {t[1]}`" for t in targets if t[1].startswith("С")]
+    other_targets = [f"`{t[0]} {t[1]}`" for t in targets if not t[1].startswith("М") and not t[1].startswith("С")]
+
+    wash_str = " → ".join(wash_targets) if wash_targets else "_Не выбрана_"
+    dry_str = " → ".join(dry_targets) if dry_targets else "_Не выбрана_"
+
     wins_str = ", ".join([f"`{w[0]}-{w[1]}`" for w in windows]) if windows else "_Нет_"
     logs_str = ", ".join([f"`{l}`" for l in logs]) if logs else "_Нет данных_"
+
+    queue_block = (
+        f"📋 **Очередь бронирования:**\n"
+        f"🧺 **Стирка:** {wash_str}\n"
+        f"💨 **Сушка:** {dry_str}"
+    )
+    if other_targets:
+        queue_block += f"\n⚙️ **Прочее:** {' → '.join(other_targets)}"
 
     text = (
         f"🧺 **Панель управления снайпером**\n\n"
@@ -429,7 +427,7 @@ def get_main_text(note: str = "") -> str:
         f"🕒 **Пинг:** `{runtime.last_ping}`\n\n"
         f"🔥 **Горячие окна (1 сек):** {wins_str}\n"
         f"🎯 **Срабатывания:** {logs_str}\n\n"
-        f"📋 **Очередь брони:**\n{targets_str}"
+        f"{queue_block}"
     )
     if note:
         text += f"\n\n{note}"
@@ -445,8 +443,8 @@ def get_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [toggle_btn],
         [InlineKeyboardButton(text="📅 Дата", callback_data="m_date"), InlineKeyboardButton(text="➕ Слот", callback_data="m_slot")],
-        [InlineKeyboardButton(text="🗑 Очистить слоты", callback_data="c_slots"), InlineKeyboardButton(text="🔄 Обновить", callback_data="back")],
-        [InlineKeyboardButton(text="🛠 Отладка и настройки", callback_data="m_debug")]
+        [InlineKeyboardButton(text="📁 Пресеты", callback_data="m_preset"), InlineKeyboardButton(text="🗑 Очистить", callback_data="c_slots")],
+        [InlineKeyboardButton(text="🛠 Отладка", callback_data="m_debug"), InlineKeyboardButton(text="🔄 Обновить", callback_data="back")]
     ])
 
 
@@ -460,7 +458,6 @@ def get_debug_kb() -> InlineKeyboardMarkup:
     ])
 
 
-# --- Хэндлеры команд и кнопок ---
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -484,6 +481,7 @@ async def cb_start(call: CallbackQuery):
         await call.answer("Добавьте слоты перед запуском!", show_alert=True)
         return
     runtime.is_running = True
+    runtime.mode_str = "Запуск..."
     runtime.task = asyncio.create_task(sniper_worker(call.message.chat.id))
     await call.message.edit_text(get_main_text("🎯 _Снайпер запущен!_"), parse_mode="Markdown", reply_markup=get_main_kb())
     await call.answer()
@@ -589,44 +587,83 @@ async def proc_custom_d(message: Message, state: FSMContext):
         await message.answer("❌ Формат должен быть `ДД.ММ.ГГГГ`")
 
 
-# Слоты
+# Слоты с выбором длительности (1ч или 2ч)
 @dp.callback_query(F.data == "m_slot")
 async def cb_slot(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⏱ 1 час", callback_data="slot_dur:1"),
+            InlineKeyboardButton(text="⏱ 2 часа подряд", callback_data="slot_dur:2")
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
+    ])
+    await call.message.edit_text("⏳ **Выберите длительность бронирования:**", parse_mode="Markdown", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("slot_dur:"))
+async def cb_slot_dur(call: CallbackQuery):
+    dur = int(call.data.split(":")[1])
+    max_h = 22 if dur == 1 else 21
     rows, row = [], []
-    for h in range(8, 23):
-        t = f"{h}:00"
-        row.append(InlineKeyboardButton(text=t, callback_data=f"pick_h:{t}"))
-        if len(row) == 3:
+    for h in range(8, max_h + 1):
+        t_label = f"{h}:00" if dur == 1 else f"{h}:00–{h+2}:00"
+        row.append(InlineKeyboardButton(text=t_label, callback_data=f"pick_h:{dur}:{h}:00"))
+        per_row = 3 if dur == 1 else 2
+        if len(row) == per_row:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
-    await call.message.edit_text("⏰ **Выберите время:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="m_slot")])
+
+    title = "⏰ **Выберите время (1 час):**" if dur == 1 else "⏰ **Выберите интервал (2 часа подряд):**"
+    await call.message.edit_text(title, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("pick_h:"))
 async def cb_pick_h(call: CallbackQuery):
-    runtime.temp_hour = call.data.split(":")[1]
+    parts = call.data.split(":")
+    dur = int(parts[1])
+    hour = f"{parts[2]}:{parts[3]}"
+    dur_label = "1 час" if dur == 1 else "2 часа подряд"
+
     kb = [
-        [InlineKeyboardButton(text="🧺 М1", callback_data="pick_m:М1"), InlineKeyboardButton(text="🧺 М3", callback_data="pick_m:М3")],
-        [InlineKeyboardButton(text="🧺 М5", callback_data="pick_m:М5")],
-        [InlineKeyboardButton(text="💨 С2", callback_data="pick_m:С2"), InlineKeyboardButton(text="💨 С4", callback_data="pick_m:С4")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="m_slot")]
+        [
+            InlineKeyboardButton(text="🧺 М1", callback_data=f"pick_m:{dur}:{hour}:М1"),
+            InlineKeyboardButton(text="🧺 М3", callback_data=f"pick_m:{dur}:{hour}:М3")
+        ],
+        [InlineKeyboardButton(text="🧺 М5", callback_data=f"pick_m:{dur}:{hour}:М5")],
+        [
+            InlineKeyboardButton(text="💨 С2", callback_data=f"pick_m:{dur}:{hour}:С2"),
+            InlineKeyboardButton(text="💨 С4", callback_data=f"pick_m:{dur}:{hour}:С4")
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"slot_dur:{dur}")]
     ]
-    await call.message.edit_text(f"🧺 Выберите машинку на `{runtime.temp_hour}`:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await call.message.edit_text(
+        f"🧺 **Выберите машинку или сушилку:**\n⏰ Время: `{hour}` ({dur_label})",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("pick_m:"))
 async def cb_pick_m(call: CallbackQuery):
-    mach = call.data.split(":")[1]
-    hour = runtime.temp_hour or "19:00"
-    if ":" not in hour:
-        hour = f"{hour}:00"
-    db.add_target(hour, mach)
-    await call.message.edit_text(get_main_text(f"✅ _Добавлен слот: {hour} ({mach})_"), parse_mode="Markdown", reply_markup=get_main_kb())
+    parts = call.data.split(":")
+    dur = int(parts[1])
+    hour = f"{parts[2]}:{parts[3]}"
+    mach = parts[4]
+
+    slot_label = f"{hour} (2ч)" if dur == 2 else hour
+    db.add_target(slot_label, mach)
+
+    await call.message.edit_text(
+        get_main_text(f"✅ _Добавлен слот: {slot_label} ({mach})_"),
+        parse_mode="Markdown",
+        reply_markup=get_main_kb()
+    )
     await call.answer()
 
 
@@ -637,20 +674,91 @@ async def cb_c_slots(call: CallbackQuery):
     await call.answer()
 
 
+# --- Пресеты ---
+@dp.callback_query(F.data == "m_preset")
+async def cb_preset_menu(call: CallbackQuery):
+    presets = db.get_presets()
+    kb_rows = []
+    for p_name in presets:
+        kb_rows.append([
+            InlineKeyboardButton(text=f"📌 {p_name}", callback_data=f"load_p:{p_name}"),
+            InlineKeyboardButton(text="❌", callback_data=f"del_p:{p_name}")
+        ])
+    kb_rows.append([InlineKeyboardButton(text="💾 Сохранить текущую очередь", callback_data="save_p")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
+
+    text = (
+        "📁 **Управление пресетами очереди**\n\n"
+        "Нажмите на сохранённый пресет, чтобы мгновенно загрузить его в очередь, "
+        "или сохраните текущую настроенную очередь под новым именем:"
+    )
+    await call.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "save_p")
+async def cb_save_preset(call: CallbackQuery, state: FSMContext):
+    targets = db.get_targets()
+    if not targets:
+        await call.answer("Очередь пуста! Сначала добавьте слоты через «➕ Слот».", show_alert=True)
+        return
+    await state.set_state(Form.waiting_for_preset_name)
+    await call.message.edit_text(
+        "💾 Введите название для этого пресета (например: `Будни 2ч` или `Выходные`):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="m_preset")]])
+    )
+    await call.answer()
+
+
+@dp.message(Form.waiting_for_preset_name)
+async def proc_preset_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not name or len(name) > 30:
+        await message.answer("❌ Название должно содержать от 1 до 30 символов.")
+        return
+
+    targets = db.get_targets()
+    db.save_preset(name, targets)
+    await state.clear()
+    await message.answer(
+        get_main_text(f"✅ _Пресет «{name}» успешно сохранён!_"),
+        parse_mode="Markdown",
+        reply_markup=get_main_kb()
+    )
+
+
+@dp.callback_query(F.data.startswith("load_p:"))
+async def cb_load_preset(call: CallbackQuery):
+    p_name = call.data.split(":", 1)[1]
+    if db.load_preset(p_name):
+        await call.message.edit_text(
+            get_main_text(f"✅ _Пресет «{p_name}» применён!_"),
+            parse_mode="Markdown",
+            reply_markup=get_main_kb()
+        )
+    else:
+        await call.answer("Не удалось загрузить пресет.", show_alert=True)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("del_p:"))
+async def cb_del_preset(call: CallbackQuery):
+    p_name = call.data.split(":", 1)[1]
+    db.delete_preset(p_name)
+    await call.answer(f"Пресет «{p_name}» удалён")
+    await cb_preset_menu(call)
+
+
 # Окна
 @dp.callback_query(F.data == "m_win")
 async def cb_win(call: CallbackQuery):
     buttons = []
     for s, e in db.get_windows():
-        # Было:
-        # buttons.append([InlineKeyboardButton(text=f"❌ Удалить {s}–{e}", callback_data=f"del_w:{s}:{e}")])
-        
-        # Стало (разделяем дефисом или нижним подчеркиванием):
         buttons.append([InlineKeyboardButton(text=f"❌ Удалить {s}–{e}", callback_data=f"del_w:{s}_{e}")])
     buttons.append([
         InlineKeyboardButton(text="➕ 20:58-21:05", callback_data="add_w:20:58_21:05"),
         InlineKeyboardButton(text="➕ 21:58-22:05", callback_data="add_w:21:58_22:05"),
-    ]) 
+    ])
     buttons.append([InlineKeyboardButton(text="⌨️ Свой интервал", callback_data="custom_w")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="m_debug")])
     await call.message.edit_text("🔥 **Горячие окна активности:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -659,15 +767,15 @@ async def cb_win(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("del_w:"))
 async def cb_del_w(call: CallbackQuery):
-    raw_times = call.data.split(":", 1)[1]  # Получаем "20:58_21:05"
-    s, e = raw_times.split("_")             # Извлекаем s="20:58", e="21:05"
+    raw_times = call.data.split(":", 1)[1]
+    s, e = raw_times.split("_")
     db.delete_window(s, e)
     await cb_win(call)
 
 
 @dp.callback_query(F.data.startswith("add_w:"))
 async def cb_add_w(call: CallbackQuery):
-    raw_times = call.data.split(":", 1)[1]  # Получаем "20:58_21:05"
+    raw_times = call.data.split(":", 1)[1]
     s, e = raw_times.split("_")
     db.add_window(s, e)
     await cb_win(call)

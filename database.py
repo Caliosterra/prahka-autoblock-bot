@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 from typing import List, Tuple
 
 
@@ -9,7 +10,6 @@ class Database:
         try:
             self._init_db()
         except sqlite3.DatabaseError:
-            # Если файл повреждён, удаляем и инициализируем заново
             if os.path.exists(self.db_path):
                 os.remove(self.db_path)
             self._init_db()
@@ -48,6 +48,12 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     detected_at TEXT NOT NULL,
                     window_added TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS presets (
+                    name TEXT PRIMARY KEY,
+                    slots_json TEXT NOT NULL
                 )
             """)
             conn.commit()
@@ -127,3 +133,33 @@ class Database:
         with self._get_connection() as conn:
             rows = conn.execute("SELECT detected_at FROM update_logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
             return [r["detected_at"] for r in rows]
+
+    # --- Пресеты очередей ---
+    def get_presets(self) -> List[str]:
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT name FROM presets ORDER BY name ASC").fetchall()
+            return [r["name"] for r in rows]
+
+    def save_preset(self, name: str, targets: List[Tuple[str, str]]):
+        with self._get_connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO presets (name, slots_json) VALUES (?, ?)",
+                (name, json.dumps(targets))
+            )
+            conn.commit()
+
+    def load_preset(self, name: str) -> bool:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT slots_json FROM presets WHERE name = ?", (name,)).fetchone()
+            if not row:
+                return False
+            slots = json.loads(row["slots_json"])
+            self.clear_targets()
+            for time_slot, machine_code in slots:
+                self.add_target(time_slot, machine_code)
+            return True
+
+    def delete_preset(self, name: str):
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM presets WHERE name = ?", (name,))
+            conn.commit()
