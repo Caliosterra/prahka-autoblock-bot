@@ -1,8 +1,20 @@
-prachka.db
-prachka.db-journal
+# Секреты и доступы
 .env
 credentials.json
+
+# SQLite (база, rollback-журналы, WAL и shm)
+*.db
+*.db-*
+prachka.db
+prachka.db-journal
+
+# Виртуальные окружения и IDE
 venv/
 .venv/
-__pycache__/
 .idea/
+.vscode/
+
+# Кэш Python и временные скрипты
+__pycache__/
+*.py[cod]
+replace_*.py
