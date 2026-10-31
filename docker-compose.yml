@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: prachka_bot
+    restart: always
+    volumes:
+      # База данных сохраняется прямо на диске сервера
+      - ./prachka.db:/app/prachka.db
+      - ./credentials.json:/app/credentials.json:ro
+      - ./.env:/app/.env:ro

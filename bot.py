@@ -233,13 +233,26 @@ async def sniper_worker(chat_id: int):
 
                 successful_bookings = []
                 failed_categories = []
+                # Проверяем, включена ли задержка человека в настройках
+                delay_enabled = db.get_setting("human_delay", "1") == "1"
+                human_delay_done = not delay_enabled  # Имитация человека только 1 раз за весь цикл бронирования
 
-                for cat_name, cat_slots in categories_to_book:
+                for cat_idx, (cat_name, cat_slots) in enumerate(categories_to_book):
                     cat_booked = False
+
+                    # Если это вторая ветка (Сушка), обязательно перечитываем сетку из таблицы,
+                    # чтобы не работать с устаревшими данными 20-секундной давности
+                    if cat_idx > 0:
+                        logging.info(f"🔄 Обновляю данные таблицы перед веткой «{cat_name}»...")
+                        try:
+                            grid = await asyncio.to_thread(sheet.get_values, "A1:W20")
+                        except Exception as e:
+                            logging.warning(f"Не удалось обновить сетку перед {cat_name}: {e}")
+
                     logging.info(f"Начинаю бронирование ветки: {cat_name} (вариантов: {len(cat_slots)})")
 
                     for idx, (time_str, mach_code) in enumerate(cat_slots):
-                        is_first_priority = (idx == 0)
+                        is_first_priority = (idx == 0) and not human_delay_done
 
                         if mach_code not in MACHINE_OFFSETS:
                             continue
@@ -277,6 +290,7 @@ async def sniper_worker(chat_id: int):
                                 if is_first_priority:
                                     human_delay = round(random.uniform(1.8, 2.4), 2)
                                     logging.info(f"[{cat_name}] Первый приоритет свободен! Пауза имитации человека: {human_delay} с...")
+                                    human_delay_done = True
                                     await asyncio.sleep(human_delay)
 
                                 logging.info(f"Оба часа свободны! Записываю {room} в {cell1} и {cell2}...")
@@ -332,6 +346,7 @@ async def sniper_worker(chat_id: int):
                                 if is_first_priority:
                                     human_delay = round(random.uniform(1.8, 2.4), 2)
                                     logging.info(f"[{cat_name}] Первый приоритет свободен! Пауза имитации человека: {human_delay} с...")
+                                    human_delay_done = True
                                     await asyncio.sleep(human_delay)
 
                                 logging.info(f"Слот {cell1} свободен, записываю {room}...")
@@ -380,10 +395,67 @@ async def sniper_worker(chat_id: int):
                         f"✅ **УСПЕШНАЯ БРОНЬ!**\n\n"
                         f"📅 Дата: `{target_date}`\n"
                         f"🏠 Комната: `{room}`\n\n"
-                        f"{booked_text}{fail_text}",
+                        f"{booked_text}{fail_text}\n\n"
+                        f"🛡 _Включаю защиту ячеек от перезаписи на 15 сек..._",
                         parse_mode="Markdown",
                         reply_markup=get_main_kb()
                     )
+
+                    # --- Охранный режим ячеек (Sentry Mode) ---
+                    # Собираем все занятые ячейки в плоский список
+                    monitored_cells = []
+                    for b in successful_bookings:
+                        for c in b["cell"].split(","):
+                            c_clean = c.strip()
+                            if c_clean and c_clean not in monitored_cells:
+                                monitored_cells.append(c_clean)
+
+                    overwrites_count = {cell: 0 for cell in monitored_cells}
+                    abandoned_cells = set()
+
+                    logging.info(f"🛡 Запуск Sentry-защиты для ячеек: {monitored_cells}")
+                    sentry_checks = 6  # 6 проверок по 2.5 сек = 15 секунд
+
+                    for _ in range(sentry_checks):
+                        await asyncio.sleep(2.5)
+                        try:
+                            # Пакетное чтение всех ячеек за один вызов API
+                            batch_res = await asyncio.to_thread(sheet.batch_get, monitored_cells)
+                            for idx_cell, cell_name in enumerate(monitored_cells):
+                                if cell_name in abandoned_cells:
+                                    continue
+
+                                cell_data = batch_res[idx_cell]
+                                val = cell_data[0][0].strip() if (cell_data and cell_data[0]) else ""
+
+                                if val != room:
+                                    overwrites_count[cell_name] += 1
+                                    current_try = overwrites_count[cell_name]
+                                    logging.warning(f"🚨 Чужая запись в ячейке {cell_name}: '{val}'! Попытка возврата {current_try}/2")
+
+                                    if current_try <= 2:
+                                        await bot.send_message(
+                                            chat_id,
+                                            f"⚠️ **Внимание!** В вашей ячейке `{cell_name}` обнаружена чужая запись: `{val or 'Пусто'}`.\n"
+                                            f"🔁 Переписываю обратно на `{room}` (попытка {current_try}/2)...",
+                                            parse_mode="Markdown"
+                                        )
+                                        await asyncio.to_thread(sheet.update_acell, cell_name, room)
+                                    else:
+                                        abandoned_cells.add(cell_name)
+                                        await bot.send_message(
+                                            chat_id,
+                                            f"🚨 **Война за слот `{cell_name}`!**\n\n"
+                                            f"Комната `{val}` упорно перетирает вашу запись. "
+                                            f"Бот остановил авто-перезапись во избежание санкций от администрации таблицы. "
+                                            f"Пожалуйста, свяжитесь с соседом или решите вопрос вручную!",
+                                            parse_mode="Markdown"
+                                        )
+                        except Exception as e:
+                            logging.warning(f"Ошибка в цикле Sentry-защиты: {e}")
+
+                    logging.info("🛡 Sentry-защита ячеек благополучно завершена.")
+
                 else:
                     await bot.send_message(chat_id, "❌ Все выбранные слоты заняты!", reply_markup=get_main_kb())
                 break
@@ -450,9 +522,12 @@ def get_main_kb() -> InlineKeyboardMarkup:
 
 def get_debug_kb() -> InlineKeyboardMarkup:
     cur_log = db.get_setting("log_level", "INFO")
+    delay_on = db.get_setting("human_delay", "1") == "1"
+    delay_btn_text = "🎭 Задержка человека: ВКЛ" if delay_on else "⚡️ Задержка человека: ВЫКЛ (Макс. скорость)"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Проверить таблицу", callback_data="check_tbl"), InlineKeyboardButton(text="🔗 Ссылка на таблицу", callback_data="m_url")],
         [InlineKeyboardButton(text="🔥 Горячие окна", callback_data="m_win"), InlineKeyboardButton(text="🏠 Сменить комнату", callback_data="m_room")],
+        [InlineKeyboardButton(text=delay_btn_text, callback_data="toggle_delay")],
         [InlineKeyboardButton(text=f"📜 Логирование: [{cur_log}]", callback_data="m_log_lvl")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back")]
     ])
@@ -498,8 +573,9 @@ async def cb_stop(call: CallbackQuery):
 
 
 @dp.callback_query(F.data == "m_debug")
-async def cb_debug(call: CallbackQuery, state: FSMContext):
-    await state.clear()
+async def cb_debug(call: CallbackQuery, state: Optional[FSMContext] = None):
+    if state is not None:
+        await state.clear()
     cur_url = db.get_setting("sheet_url", "по умолчанию из .env")
     room = db.get_setting("room", DEFAULT_ROOM)
     cur_log = db.get_setting("log_level", "INFO")
@@ -538,12 +614,20 @@ async def cb_log_lvl_menu(call: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("set_log:"))
-async def cb_set_log(call: CallbackQuery):
+async def cb_set_log(call: CallbackQuery, state: FSMContext):
     lvl = call.data.split(":")[1]
     db.set_setting("log_level", lvl)
     apply_log_level(lvl)
     logging.warning(f"Уровень логирования изменён пользователем на: {lvl}")
-    await cb_debug(call, None)
+    await cb_debug(call, state)
+
+
+@dp.callback_query(F.data == "toggle_delay")
+async def cb_toggle_delay(call: CallbackQuery, state: Optional[FSMContext] = None):
+    cur_delay = db.get_setting("human_delay", "1")
+    new_delay = "0" if cur_delay == "1" else "1"
+    db.set_setting("human_delay", new_delay)
+    await cb_debug(call, state)
 
 
 # Дата
