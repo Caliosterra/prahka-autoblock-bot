@@ -163,3 +163,23 @@ class Database:
         with self._get_connection() as conn:
             conn.execute("DELETE FROM presets WHERE name = ?", (name,))
             conn.commit()
+
+    # --- Пресеты конфигурации бронирования (время + машинки) ---
+    def save_preset_config(self, name: str, config: dict):
+        with self._get_connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO presets (name, slots_json) VALUES (?, ?)",
+                (name, json.dumps(config, ensure_ascii=False))
+            )
+            conn.commit()
+
+    def get_preset_config(self, name: str):
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT slots_json FROM presets WHERE name = ?", (name,)).fetchone()
+            if not row:
+                return None
+            try:
+                data = json.loads(row["slots_json"])
+            except (ValueError, TypeError):
+                return None
+            return data if isinstance(data, dict) else None

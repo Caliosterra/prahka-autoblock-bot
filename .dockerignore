@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 replace_*.py
+credentials.json
+token.json
+oauth_client.json
+*.db
+*.db-*

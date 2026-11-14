@@ -6,5 +6,5 @@ services:
     volumes:
       # База данных сохраняется прямо на диске сервера
       - ./prachka.db:/app/prachka.db
-      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json:rw
       - ./.env:/app/.env:ro
