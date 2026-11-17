@@ -483,14 +483,21 @@ async def sniper_worker(chat_id: int):
             if changed:
                 s_win = (now - timedelta(minutes=2)).strftime("%H:%M")
                 e_win = (now + timedelta(minutes=3)).strftime("%H:%M")
-                db.add_window(s_win, e_win)
-                db.log_update(now.strftime("%d.%m %H:%M:%S"), f"{s_win}–{e_win}")
-                logging.info(f"Обнаружено обновление таблицы в {runtime.last_ping}! Новое окно: {s_win}–{e_win}")
-                await bot.send_message(
-                    chat_id,
-                    f"🧠 **Таблица обновилась в {runtime.last_ping}!**\nДобавлено горячее окно `{s_win}–{e_win}`.",
-                    parse_mode="Markdown"
-                )
+                already_hot, matched_window = in_hot_window(now)
+                if already_hot:
+                    logging.info(
+                        f"ℹ️ Обновление таблицы зафиксировано внутри уже активного интервала спама ({matched_window}) — новое окно не создаём."
+                    )
+                    db.log_update(now.strftime("%d.%m %H:%M:%S"), f"уже в {matched_window}")
+                else:
+                    db.add_window(s_win, e_win)
+                    db.log_update(now.strftime("%d.%m %H:%M:%S"), f"{s_win}–{e_win}")
+                    logging.info(f"Обнаружено обновление таблицы в {runtime.last_ping}! Новое окно: {s_win}–{e_win}")
+                    await bot.send_message(
+                        chat_id,
+                        f"🧠 **Таблица обновилась в {runtime.last_ping}!**\nДобавлено горячее окно `{s_win}–{e_win}`.",
+                        parse_mode="Markdown"
+                    )
 
             base_col = None
             if target_date and target_date in left_h:
