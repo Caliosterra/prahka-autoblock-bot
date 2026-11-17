@@ -1143,10 +1143,11 @@ async def cb_add_dur(call: CallbackQuery):
     dur = int(parts[2])
 
     times = get_booking_times()
-    times = [t for t in times if int(t.get("hour", -1)) != hour]
-    times.append({"hour": hour, "duration": dur})
-    times.sort(key=lambda t: int(t["hour"]))
-    set_booking_times(times)
+    exists = any(int(t.get("hour", -1)) == hour and int(t.get("duration", -1)) == dur for t in times)
+    if not exists:
+        times.append({"hour": hour, "duration": dur})
+        times.sort(key=lambda t: (int(t["hour"]), int(t["duration"])))
+        set_booking_times(times)
 
     await cb_cfg_times(call)
 
