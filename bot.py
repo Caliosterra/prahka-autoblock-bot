@@ -1078,8 +1078,8 @@ async def cb_cfg_booking(call: CallbackQuery):
 
 
 # --- Раздел «Время и длительность» ---
-@dp.callback_query(F.data == "cfg_times")
-async def cb_cfg_times(call: CallbackQuery):
+def _get_times_menu() -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и клавиатура меню очереди времени (порядок = приоритет снайпера)."""
     times = get_booking_times()
     if times:
         lines = []
@@ -1091,18 +1091,108 @@ async def cb_cfg_times(call: CallbackQuery):
     else:
         times_str = "_Список пуст_"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить время", callback_data="add_h")],
-        [InlineKeyboardButton(text="🗑 Очистить список времён", callback_data="clear_times")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="cfg_booking")]
-    ])
-    await call.message.edit_text(
+    rows = []
+    for idx, t in enumerate(times):
+        h = int(t["hour"])
+        d = int(t["duration"])
+        rows.append([
+            InlineKeyboardButton(text=f"{idx + 1}. {h:02d}:00 ({d}ч)", callback_data=f"tq_dur:{idx}"),
+            InlineKeyboardButton(text="⬆️", callback_data=f"tq_up:{idx}") if idx > 0 else InlineKeyboardButton(text="·", callback_data="tq_noop"),
+            InlineKeyboardButton(text="⬇️", callback_data=f"tq_dn:{idx}") if idx < len(times) - 1 else InlineKeyboardButton(text="·", callback_data="tq_noop"),
+            InlineKeyboardButton(text="🗑", callback_data=f"tq_del:{idx}"),
+        ])
+
+    rows.append([InlineKeyboardButton(text="➕ Добавить время", callback_data="add_h")])
+    if times:
+        rows.append([InlineKeyboardButton(text="🗑 Очистить список времён", callback_data="clear_times")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="cfg_booking")])
+
+    text = (
         f"🕒 **Время и длительность**\n\n{times_str}\n\n"
-        "Бронь всегда парная: стирка на T, сушка на T+1.",
-        parse_mode="Markdown",
-        reply_markup=kb
+        "Бронь всегда парная: стирка на T, сушка на T+1.\n"
+        "Порядок сверху вниз — приоритет проверки снайпером.\n"
+        "Нажатие на слот переключает 1ч ↔ 2ч, ⬆️/⬇️ меняют приоритет, 🗑 удаляет строку."
     )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _edit_times_menu(call: CallbackQuery):
+    text, kb = _get_times_menu()
+    try:
+        await call.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
+@dp.callback_query(F.data == "cfg_times")
+async def cb_cfg_times(call: CallbackQuery):
+    await _edit_times_menu(call)
     await call.answer()
+
+
+@dp.callback_query(F.data == "tq_noop")
+async def cb_tq_noop(call: CallbackQuery):
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tq_up:"))
+async def cb_tq_up(call: CallbackQuery):
+    idx = int(call.data.split(":", 1)[1])
+    times = get_booking_times()
+    if 1 <= idx < len(times):
+        times[idx - 1], times[idx] = times[idx], times[idx - 1]
+        set_booking_times(times)
+        await _edit_times_menu(call)
+        await call.answer("⬆️ Приоритет повышен")
+    else:
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tq_dn:"))
+async def cb_tq_dn(call: CallbackQuery):
+    idx = int(call.data.split(":", 1)[1])
+    times = get_booking_times()
+    if 0 <= idx < len(times) - 1:
+        times[idx], times[idx + 1] = times[idx + 1], times[idx]
+        set_booking_times(times)
+        await _edit_times_menu(call)
+        await call.answer("⬇️ Приоритет понижен")
+    else:
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tq_dur:"))
+async def cb_tq_dur(call: CallbackQuery):
+    idx = int(call.data.split(":", 1)[1])
+    times = get_booking_times()
+    if 0 <= idx < len(times):
+        cur_h = int(times[idx]["hour"])
+        new_dur = 1 if int(times[idx]["duration"]) == 2 else 2
+        dup = any(j != idx and int(t["hour"]) == cur_h and int(t["duration"]) == new_dur
+                  for j, t in enumerate(times))
+        if dup:
+            await call.answer(f"Слот {cur_h:02d}:00 ({new_dur}ч) уже есть в очереди", show_alert=False)
+            return
+        times[idx]["duration"] = new_dur
+        set_booking_times(times)
+        await _edit_times_menu(call)
+        await call.answer(f"Изменено: {cur_h:02d}:00 ({new_dur}ч)")
+    else:
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tq_del:"))
+async def cb_tq_del(call: CallbackQuery):
+    idx = int(call.data.split(":", 1)[1])
+    times = get_booking_times()
+    if 0 <= idx < len(times):
+        removed = times.pop(idx)
+        set_booking_times(times)
+        await _edit_times_menu(call)
+        await call.answer(f"🗑 Удалено: {int(removed['hour']):02d}:00 ({int(removed['duration'])}ч)")
+    else:
+        await call.answer()
 
 
 @dp.callback_query(F.data == "add_h")
